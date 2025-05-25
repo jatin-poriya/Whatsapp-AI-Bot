@@ -1,9 +1,12 @@
 const BOT_START_TIME = Math.floor(Date.now() / 1000); // UNIX timestamp in seconds
 const stopMap = new Map(); // JID => expiry timestamp (ms)
 
-const DELAY_REPLY_MS = 4500; // 4.5 seconds delay
+const DELAY_REPLY_MS = 6500; // 6.5 seconds delay
 const pendingMessages = new Map(); // JID => [{ id, timestamp }]
 const recentActivityMap = new Map(); // JID => timestamp of last manual reply
+
+const conversationMemory = new Map(); // JID => [ { role, content } ]
+const MAX_HISTORY = 10;
 
 require("dotenv").config();
 const express = require("express");
@@ -22,7 +25,7 @@ app.get("/", (_, res) => res.send("🤖 WhatsApp AI Bot is running."));
 app.listen(PORT, () => console.log(`✅ Web server listening on port ${PORT}`));
 
 const job = require("./cron");
-const { buildPrompt } = require("./buildPropmt");
+const { buildContentsArray } = require("./buildPropmt");
 job.start();
 
 const store = {};
@@ -61,14 +64,18 @@ function extractMessageText(message) {
 }
 
 // 🤖 Gemini AI Handler
-async function fetchGeminiReply(msg, senderName) {
+async function fetchGeminiReply(senderName, jid) {
   try {
-    const prompt = buildPrompt(msg, senderName);
+    const history = conversationMemory.get(jid) || [];
+    const contents = buildContentsArray(history, senderName);
 
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents },
       {
-        contents: [{ parts: [{ text: prompt }], role: "user" }],
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
     );
 
@@ -78,7 +85,7 @@ async function fetchGeminiReply(msg, senderName) {
 
     return `🤖: ${reply}`;
   } catch (error) {
-    console.error("Gemini API Error:", error.message);
+    console.error("Gemini API Error:", error.response?.data || error.message);
     return "❌ Automated reply failed.";
   }
 }
@@ -128,27 +135,17 @@ async function connectWhatsAPP() {
       const sender = msg.pushName || "Unknown";
 
       // ✅ 1. If message is from you (fromMe) — treat as manual reply
-      if (key.fromMe) {
-        recentActivityMap.set(jid, Date.now());
-        console.log("🧍 Manual reply detected to:", jid);
-
-        // Remove all pending messages for that JID
-        if (pendingMessages.has(jid)) {
-          console.log("✅ Skipping bot reply for", jid, "(manual reply sent)");
-          pendingMessages.delete(jid);
-        }
-        continue;
-      }
+      if (skipReply(key.fromMe, jid)) continue;
 
       // ✅ 2. Skip messages sent before bot started
       if (messageTimestamp < BOT_START_TIME) {
-        console.log("⏩ Old message ignored:", extractMessageText(msg));
+        // console.log("⏩ Old message ignored:", extractMessageText(msg));
         continue;
       }
 
       // ✅ 3. Skip already seen messages
       if (isMessageSeen(key.id)) {
-        console.log("👀 Already replied:", extractMessageText(msg));
+        // console.log("👀 Already replied:", extractMessageText(msg));
         continue;
       }
 
@@ -158,13 +155,19 @@ async function connectWhatsAPP() {
 
       console.log(`📩 Message from ${sender}: "${text}"`);
 
+      // 🧠 Store user message in conversation history
+      const history = conversationMemory.get(jid) || [];
+      history.push({ role: "user", content: text });
+      if (history.length > MAX_HISTORY) history.shift();
+      conversationMemory.set(jid, history);
+
       // ✅ 5. Handle #stop command
       if (text.toLowerCase().includes("#stop")) {
         stopMap.set(jid, Date.now() + 1000 * 60 * 60 * 5); // 5 hour
         await socket.sendMessage(
           jid,
           {
-            text: "🤖 Auto-reply paused for 1 hour. Send any message to resume sooner.",
+            text: "🤖 Auto-reply paused for 5 hour.",
           },
           { quoted: msg }
         );
@@ -175,7 +178,7 @@ async function connectWhatsAPP() {
       // ✅ 6. Check if muted
       const muteUntil = stopMap.get(jid);
       if (muteUntil && Date.now() < muteUntil) {
-        console.log(`🔕 Skipping (muted): ${sender}`);
+        // console.log(`🔕 Skipping (muted): ${sender}`);
         continue;
       }
 
@@ -212,8 +215,15 @@ async function connectWhatsAPP() {
           return;
         }
 
-        const reply = await fetchGeminiReply(text, sender);
+        const reply = await fetchGeminiReply(sender, jid);
         await socket.sendMessage(jid, { text: reply }, { quoted: msg });
+
+        // 🧠 Store bot's reply in conversation history
+        const hist = conversationMemory.get(jid) || [];
+        hist.push({ role: "model", content: reply.replace("🤖: ", "") });
+        if (hist.length > MAX_HISTORY) hist.shift();
+        conversationMemory.set(jid, hist);
+
         recentActivityMap.set(jid, Date.now());
         console.log(`🤖 Replied to ${sender}: "${reply}"`);
 
@@ -228,6 +238,21 @@ async function connectWhatsAPP() {
       //
     }
   });
+}
+
+function skipReply(fromMe, jid) {
+  if (fromMe) {
+    recentActivityMap.set(jid, Date.now());
+    // console.log("🧍 Manual reply detected to:", jid);
+
+    // Remove all pending messages for that JID
+    if (pendingMessages.has(jid)) {
+      // console.log("✅ Skipping bot reply for", jid, "(manual reply sent)");
+      pendingMessages.delete(jid);
+    }
+    return true;
+  }
+  return false;
 }
 
 connectWhatsAPP();
