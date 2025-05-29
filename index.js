@@ -133,7 +133,7 @@ async function connectWhatsAPP() {
       const { key, messageTimestamp } = msg;
       const jid = key.remoteJid;
       const sender = msg.pushName || "Unknown";
-
+      
       // ✅ 1. If message is from you (fromMe) — treat as manual reply
       if (skipReply(key.fromMe, jid)) continue;
 
@@ -142,6 +142,13 @@ async function connectWhatsAPP() {
         // console.log("⏩ Old message ignored:", extractMessageText(msg));
         continue;
       }
+
+       // ❌ Skip auto-reply for groups
+      if (jid.endsWith("@g.us")) {
+         console.log("Group message detected, skipping auto-reply.");
+        continue;
+      }
+      
 
       // ✅ 3. Skip already seen messages
       if (isMessageSeen(key.id)) {
